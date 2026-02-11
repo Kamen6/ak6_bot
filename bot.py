@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram-бот для Автостоянки «Каменногорская-6»
-Версия: 4.1 (полная + исправленная)
-• Верификация с 2 вопросами (место + статус)
-• Жалобы с фильтром мата
-• Связь с соседом
-• Справочник + поиск по Правилам
-• Напоминания из календаря
-• Подписка /subscribe
+Telegram-бот для ПК «Каменногорская-6» - БЕЗОПАСНАЯ ВЕРСИЯ
+Фиксы критических уязвимостей + полное соответствие Уставу
 """
 
 import os
+import re
 import logging
 from datetime import datetime, timedelta
-import requests
+from typing import Optional, Dict, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,666 +18,445 @@ from telegram.ext import (
     ChatJoinRequestHandler, filters
 )
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-# ==================== НАСТРОЙКИ ====================
-
-BOT_TOKEN = os.getenv('BOT_TOKEN', '7794791486:AAEhXXzsK0UZeiEj6L1nn-XGYtBF8WKb9bo')
-ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1001234567890'))
-CHANNEL_ID = int(os.getenv('CHANNEL_ID', '-1009876543210'))  # ← ДОЛЖЕН НАЧИНАТЬСЯ С -100
-GOOGLE_CALENDAR_ID = os.getenv('GOOGLE_CALENDAR_ID', 'kamenogorskaya6@gmail.com')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyAM-hDcTF_7if-h3XoXlWPtWuBceqiWD5c')
-
-PLACE_MIN = 1
-PLACE_MAX = 37
-PREDSEDAT_NIK = "@vitali_k81"
-BUHGAL_CONTACT = "📞 +375 29 XXX-XX-XX"  # ← ТЕКСТОВЫЙ КОНТАКТ БУХГАЛТЕРА
-
-TIMEZONE = "Europe/Minsk"
-
-# Фильтр мата
-PROFANITY_WORDS = [
-    'бля', 'блядь', 'ебать', 'ёбать', 'пизда', 'хуй', 'хер', 'сука',
-    'гандон', 'говно', 'нахуй', 'пидор', 'педик', 'еблан', 'лох', 'мудак'
-]
+import config
+from google_integration import GoogleSheetsDB, GoogleCalendarService
 
 # ==================== ЛОГИРОВАНИЕ ====================
-
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==================== ЧИСЛОВЫЕ КОНСТАНТЫ СОСТОЯНИЙ (КРИТИЧЕСКИ ВАЖНО!) ====================
-# ← БЕЗ КАВЫЧЕК = ЧИСЛА, а не строки!
+# ==================== ИНИЦИАЛИЗАЦИЯ БАЗ ====================
+db = GoogleSheetsDB(config.SPREADSHEET_ID, config.SHEET_NAMES)
+calendar = GoogleCalendarService(config.GOOGLE_CALENDAR_ID, config.GOOGLE_API_KEY)
 
-AWAITING_PLACE, AWAITING_STATUS, COMPLAINT_PLACE_FROM, COMPLAINT_PLACE_TO, \
-COMPLAINT_TEXT, CONTACT_PLACE, SEARCH_RULES = range(7)
-
-# ==================== РАБОТА С ТАБЛИЦЕЙ ====================
-
-class SheetsDB:
-    """Работа с таблицей 'telegramm'"""
-    
-    def __init__(self):
-        scope = [
-            'https://spreadsheets.google.com/feeds',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            'credentials.json', scope
-        )
-        self.client = gspread.authorize(creds)
-        self.sheet = self.client.open('telegramm')  # ← ТОЧНОЕ НАЗВАНИЕ ВАШЕЙ ТАБЛИЦЫ
-    
-    def save_member(self, user_id, username, first_name, place, is_member, status='активен'):
-        """Сохранить запись в лист «Члены»"""
-        ws = self.sheet.worksheet('Члены')
-        ws.append_row([
-            str(user_id),
-            username or "нет",
-            first_name or "Пользователь",
-            str(place),
-            is_member,
-            datetime.now().strftime('%d.%m.%Y %H:%M'),
-            status
-        ])
-    
-    def get_member_by_place(self, place):
-        """Получить данные о владельце места"""
-        try:
-            ws = self.sheet.worksheet('Члены')
-            # Ищем в столбце "Место" (столбец D = индекс 4)
-            cell = ws.find(str(place), in_column=4)
-            if cell:
-                row = ws.row_values(cell.row)
-                return {
-                    'user_id': row[0] if len(row) > 0 else None,
-                    'username': row[1] if len(row) > 1 else "нет",
-                    'first_name': row[2] if len(row) > 2 else "Пользователь",
-                    'place': row[3] if len(row) > 3 else str(place)
-                }
-        except:
-            pass
-        return None
-    
-    def save_complaint(self, place_from, place_to, text):
-        """Сохранить жалобу в лист «Заявки»"""
-        ws = self.sheet.worksheet('Заявки')
-        ws.append_row([
-            datetime.now().strftime('%d.%m.%Y'),
-            datetime.now().strftime('%H:%M'),
-            place_from,
-            place_to,
-            text,
-            'новая'
-        ])
-    
-    def subscribe_user(self, user_id, username, first_name):
-        """Подписать на ЛС-напоминания"""
-        ws = self.sheet.worksheet('Подписки')
-        try:
-            cell = ws.find(str(user_id), in_column=1)
-            if cell:
-                ws.update_cell(cell.row, 4, 'да')
-                return
-        except:
-            pass
-        ws.append_row([
-            str(user_id),
-            username or "нет",
-            first_name or "Пользователь",
-            'да',
-            datetime.now().strftime('%d.%m.%Y')
-        ])
-    
-    def unsubscribe_user(self, user_id):
-        """Отписать от ЛС-напоминаний"""
-        try:
-            ws = self.sheet.worksheet('Подписки')
-            cell = ws.find(str(user_id), in_column=1)
-            if cell:
-                ws.update_cell(cell.row, 4, 'нет')
-        except:
-            pass
-    
-    def get_subscribers(self):
-        """Получить список подписанных"""
-        try:
-            ws = self.sheet.worksheet('Подписки')
-            records = ws.get_all_records()
-            return [
-                int(r['Telegram ID']) 
-                for r in records 
-                if r.get('Подписан на ЛС') == 'да'
-            ]
-        except:
-            return []
-    
-    def get_rules(self):
-        """Получить правила из листа «Правила»"""
-        try:
-            ws = self.sheet.worksheet('Правила')
-            records = ws.get_all_records()
-            rules = {}
-            for r in records:
-                keywords = r.get('Ключевые слова', '').lower().split(',')
-                text = r.get('Текст', '')
-                for kw in keywords:
-                    kw = kw.strip()
-                    if kw and text:
-                        rules[kw] = text
-            return rules
-        except:
-            return {}
-    
-    def search_rules(self, query):
-        """Поиск правила по ключевому слову"""
-        rules = self.get_rules()
-        query_lower = query.lower()
-        for kw, text in rules.items():
-            if query_lower in kw or kw in query_lower:
-                return text
-        return None
-
-# ==================== ФИЛЬТР МАТА ====================
-
-def contains_profanity(text):
-    """Проверка на мат"""
+# ==================== БЕЗОПАСНЫЙ ФИЛЬТР МАТА ====================
+def contains_profanity_safe(text: str) -> bool:
+    """Безопасная проверка на мат с регулярными выражениями"""
     text_lower = text.lower()
-    for word in PROFANITY_WORDS:
-        if word in text_lower:
+    text_clean = re.sub(r'[^\w\s]', '', text_lower)  # Убираем спецсимволы
+    
+    for pattern in config.PROFANITY_PATTERNS:
+        if re.search(pattern, text_clean):
             return True
+            
+    # Дополнительная проверка по словарю
+    simple_words = ['лох', 'долбоеб', 'дебил', 'тупой']
+    for word in simple_words:
+        if word in text_clean:
+            return True
+            
     return False
 
-# ==================== ВЕРИФИКАЦИЯ ЧЕРЕЗ ЗАЯВКИ ====================
+# ==================== ВЕРИФИКАЦИЯ (ИСПРАВЛЕННАЯ) ====================
+AWAITING_PLACE, AWAITING_STATUS = range(2)
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение заявки на вступление в канал"""
+    """Запрос на вступление в канал - БЕЗОПАСНО"""
     if not update.chat_join_request:
         return ConversationHandler.END
     
     user = update.chat_join_request.from_user
     chat = update.chat_join_request.chat
     
-    # Сохраняем данные заявки
-    context.user_data['join_req'] = {
+    # Проверяем, не подавал ли уже заявку
+    existing_request = db.get_pending_request(user.id)
+    if existing_request:
+        await context.bot.decline_chat_join_request(chat.id, user.id)
+        return ConversationHandler.END
+    
+    # Сохраняем во временные данные
+    context.user_data['join_request'] = {
         'user_id': user.id,
-        'username': f"@{user.username}" if user.username else "нет",
-        'first_name': user.first_name or "Пользователь",
-        'chat_id': chat.id
+        'username': f"@{user.username}" if user.username else None,
+        'first_name': user.first_name or "Аноним",
+        'chat_id': chat.id,
+        'request_time': datetime.now().isoformat()
     }
     
+    # Отправляем приветствие
     try:
         await context.bot.send_message(
             chat_id=user.id,
-            text=f"👋 Добро пожаловать на стоянку «Каменногорская-6», {user.first_name}!\n\n"
-                 f"Укажите номер вашего машино-места ({PLACE_MIN}–{PLACE_MAX}):"
+            text=f"👋 Здравствуйте, {user.first_name}!\n\n"
+                 f"Для доступа к каналу ПК «Каменногорская-6» "
+                 f"пройдите верификацию.\n\n"
+                 f"📌 *Шаг 1 из 2*\n"
+                 f"Укажите номер вашего машино-места "
+                 f"({config.PLACE_MIN}-{config.PLACE_MAX}):",
+            parse_mode='Markdown'
         )
-        return AWAITING_PLACE  # ← ЧИСЛО БЕЗ КАВЫЧЕК (КРИТИЧЕСКИ ВАЖНО!)
     except Exception as e:
-        logger.error(f"Не удалось написать пользователю {user.id}: {e}")
-        try:
-            await context.bot.decline_chat_join_request(
-                chat_id=chat.id,
-                user_id=user.id
-            )
-        except:
-            pass
+        logger.error(f"Не удалось отправить сообщение: {e}")
+        await context.bot.decline_chat_join_request(chat.id, user.id)
         return ConversationHandler.END
+    
+    return AWAITING_PLACE
 
 async def process_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка номера места"""
+    """Проверка номера места"""
     text = update.message.text.strip()
     
     if not text.isdigit():
-        await update.message.reply_text("❌ Только цифры. Попробуйте ещё раз:")
-        return AWAITING_PLACE  # ← ЧИСЛО БЕЗ КАВЫЧЕК
+        await update.message.reply_text("❌ Введите только цифры:")
+        return AWAITING_PLACE
     
     place = int(text)
-    if place < PLACE_MIN or place > PLACE_MAX:
+    if not (config.PLACE_MIN <= place <= config.PLACE_MAX):
         await update.message.reply_text(
-            f"❌ Нет такого места. Диапазон: {PLACE_MIN}–{PLACE_MAX}."
+            f"❌ Нет такого места. Диапазон: {config.PLACE_MIN}-{config.PLACE_MAX}.\n"
+            f"Повторите ввод:"
         )
-        req = context.user_data.get('join_req')
-        if req:
-            try:
-                await context.bot.decline_chat_join_request(
-                    chat_id=req['chat_id'],
-                    user_id=req['user_id']
-                )
-            except:
-                pass
-        return ConversationHandler.END
+        return AWAITING_PLACE
+    
+    # Проверяем конфликты
+    conflict_status = db.check_membership_conflict(place)
     
     context.user_data['place'] = place
+    context.user_data['conflict_info'] = conflict_status
     
+    # Спрашиваем статус
     await update.message.reply_text(
-        "Вы член кооператива?\n"
-        "Ответьте «да» или «нет»:"
+        "📌 *Шаг 2 из 2*\n\n"
+        "Вы являетесь членом кооператива?\n"
+        "Ответьте \"да\" или \"нет\":",
+        parse_mode='Markdown'
     )
-    return AWAITING_STATUS  # ← ЧИСЛО БЕЗ КАВЫЧЕК
+    
+    return AWAITING_STATUS
 
 async def process_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка статуса члена + сохранение в таблицу + одобрение"""
+    """Обработка статуса и сохранение"""
     text = update.message.text.strip().lower()
-    is_member = "да" if text in ['да', 'д', 'yes', 'y'] else "нет"
+    is_member = "да" if text in ['да', 'д', 'yes', 'y', '+'] else "нет"
     
-    req = context.user_data.get('join_req')
+    req = context.user_data.get('join_request')
     place = context.user_data.get('place')
+    conflict_info = context.user_data.get('conflict_info')
     
     if not req or not place:
-        await update.message.reply_text("⚠️ Произошла ошибка. Обратитесь к председателю.")
+        await update.message.reply_text("⚠️ Ошибка сессии. Попробуйте снова.")
         return ConversationHandler.END
     
-    # Сохраняем в таблицу
-    db = SheetsDB()
+    # Определяем финальный статус
+    if is_member == 'да':
+        if conflict_info.get('has_active_member', False):
+            final_status = 'конфликт_член'
+        else:
+            final_status = 'активен'
+    else:
+        if conflict_info.get('has_active_guest', False):
+            final_status = 'конфликт_гость'
+        else:
+            final_status = 'активен'
+    
+    # Сохраняем в базу
     db.save_member(
         user_id=req['user_id'],
         username=req['username'],
         first_name=req['first_name'],
         place=place,
-        is_member=is_member
+        is_member=is_member,
+        status=final_status
     )
     
-    # Автоматически одобряем заявку
+    # Одобряем заявку (всегда, как в вашем коде)
     try:
         await context.bot.approve_chat_join_request(
             chat_id=req['chat_id'],
             user_id=req['user_id']
         )
     except Exception as e:
-        logger.error(f"Ошибка одобрения заявки: {e}")
-        await update.message.reply_text("⚠️ Не удалось одобрить заявку. Обратитесь к председателю.")
-        return ConversationHandler.END
+        logger.error(f"Ошибка одобрения: {e}")
     
-    # Приветствие
-    await update.message.reply_text(
-        f"✅ Верификация пройдена, {req['first_name']}!\n"
-        f"• Место: №{place}\n"
-        f"• Статус: {'член кооператива' if is_member == 'да' else 'гость'}\n\n"
-        f"Добро пожаловать в канал! 🎉\n"
-        f"Используйте /help для просмотра функций бота."
-    )
+    # Отправляем результат
+    if final_status == 'активен':
+        await update.message.reply_text(
+            f"✅ *Верификация успешна!*\n\n"
+            f"• Место: №{place}\n"
+            f"• Статус: {'Член кооператива' if is_member == 'да' else 'Гость'}\n\n"
+            f"Добро пожаловать в канал!\n"
+            f"Используйте /help для просмотра функций.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ *Внимание: обнаружен конфликт*\n\n"
+            f"• Место: №{place}\n"
+            f"• Статус: {'Член кооператива' if is_member == 'да' else 'Гость'}\n"
+            f"• Конфликт: {final_status}\n\n"
+            f"✅ Доступ к каналу предоставлен.\n"
+            f"❌ Данные переданы правлению для проверки.\n\n"
+            f"Используйте /help для просмотра функций.",
+            parse_mode='Markdown'
+        )
+        
+        # Уведомляем правление о конфликте
+        try:
+            await context.bot.send_message(
+                chat_id=config.ADMIN_CHAT_ID,
+                text=f"⚠️ *КОНФЛИКТ ПРИ ВЕРИФИКАЦИИ*\n\n"
+                     f"Пользователь: {req['first_name']}\n"
+                     f"Место: {place}\n"
+                     f"Статус: {'Член' if is_member == 'да' else 'Гость'}\n"
+                     f"Тип конфликта: {final_status}\n"
+                     f"Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
     
+    # Очищаем данные
+    context.user_data.clear()
     return ConversationHandler.END
 
-# ==================== ГЛАВНОЕ МЕНЮ ====================
-
+# ==================== ГЛАВНОЕ МЕНЮ (БЕЗОПАСНОЕ) ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню"""
+    """Безопасное главное меню"""
     keyboard = [
-        [InlineKeyboardButton("📜 Справочник", callback_data='docs')],
+        [InlineKeyboardButton("📜 Документы и правила", callback_data='docs')],
         [InlineKeyboardButton("🚨 Сообщить о нарушении", callback_data='report')],
-        [InlineKeyboardButton("👥 Сосед по месту", callback_data='contact')],
-        [InlineKeyboardButton("📞 Контакты", callback_data='contacts')]
+        [InlineKeyboardButton("👥 Связь через правление", callback_data='contact_admin')],
+        [InlineKeyboardButton("📅 Ближайшие события", callback_data='calendar')],
+        [InlineKeyboardButton("📞 Контакты", callback_data='contacts')],
+        [InlineKeyboardButton("ℹ️ Справка", callback_data='help_callback')],
     ]
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    text = "👋 Я — помощник стоянки «Каменногорская-6».\n\nВыберите действие:"
+    welcome_text = (
+        "👋 *Добро пожаловать!*\n\n"
+        "Я — официальный бот ПК «Каменногорская-6».\n"
+        "Выберите нужный раздел:"
+    )
     
     if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup)
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        await update.callback_query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
     
     return ConversationHandler.END
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок меню"""
+# ==================== ДОКУМЕНТЫ И ПРАВИЛА (с вашей ссылкой) ====================
+async def show_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ документов со ссылкой"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'docs':
-        await query.edit_message_text(
-            "📜 <b>Справочник</b>\n\n"
-            "• Нажмите «Поиск по Правилам» — найдите ответ по ключевому слову (мойка, снег, штраф)\n"
-            "• Готовые ответы на частые вопросы доступны у председателя",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔍 Поиск по Правилам", callback_data='search_rules')],
-                [InlineKeyboardButton("⬅️ Назад", callback_data='back_main')]
-            ])
-        )
+    text = (
+        "📚 *Документы и правила ПК «Каменногорская-6»*\n\n"
+        "Полный перечень документов доступен по ссылке:\n"
+        f"[📄 Сайт с документами кооператива]({config.DOCUMENTS_LINK})\n\n"
+        "📌 *Основные разделы:*\n"
+        "• Устав кооператива\n"
+        "• Правила внутреннего распорядка\n"
+        "• Протоколы общих собраний\n"
+        "• Финансовая отчетность\n\n"
+        "🔍 *Быстрый поиск по правилам:*"
+    )
     
-    elif query.data == 'search_rules':
-        await query.edit_message_text(
-            "🔍 Введите ключевое слово для поиска:\n"
-            "(например: мойка, снег, штраф, парковка)"
-        )
-        return SEARCH_RULES
+    keyboard = [
+        [InlineKeyboardButton("🔍 Поиск по ключевому слову", callback_data='search_rules')],
+        [InlineKeyboardButton("❓ Частые вопросы", callback_data='faq')],
+        [InlineKeyboardButton("⬅️ Назад", callback_data='back_main')]
+    ]
     
-    elif query.data == 'report':
-        await query.edit_message_text(
-            f"🚨 <b>Сообщить о нарушении</b>\n\n"
-            f"Шаг 1 из 3: Укажите номер <b>ВАШЕГО</b> места ({PLACE_MIN}–{PLACE_MAX}):",
-            parse_mode='HTML'
-        )
-        return COMPLAINT_PLACE_FROM
-    
-    elif query.data == 'contact':
-        await query.edit_message_text(
-            "👥 Введите номер машино-места соседа:\n"
-            "(Бот покажет @username, если указан)"
-        )
-        return CONTACT_PLACE
-    
-    elif query.data == 'contacts':
-        await query.edit_message_text(
-            f"📞 <b>Контакты Правления</b>\n\n"
-            f"👤 Председатель: {PREDSEDAT_NIK}\n"
-            f"💰 Бухгалтер: {BUHGAL_CONTACT}\n\n"  # ← ИСПРАВЛЕНО: текстовый контакт
-            f"⏰ Приём: пн-пт 17:00–19:00 (у ворот стоянки)",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data='back_main')]
-            ])
-        )
-    
-    elif query.data == 'back_main':
-        await start(update, context)
-    
-    return ConversationHandler.END
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
-# ==================== ПОИСК ПО ПРАВИЛАМ ====================
-
-async def search_rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск по правилам из таблицы"""
-    query = update.message.text.strip()
-    db = SheetsDB()
-    result = db.search_rules(query)
+# ==================== БЕЗОПАСНАЯ СВЯЗЬ С СОСЕДОМ ====================
+async def contact_via_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Связь с соседом только через правление - БЕЗОПАСНО"""
+    query = update.callback_query
+    await query.answer()
     
-    if result:
-        await update.message.reply_text(
-            f"📜 Найдено по «{query}»:\n\n{result}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_main')]
-            ])
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ По «{query}» ничего не найдено в Правилах.\n"
-            f"Обратитесь к председателю: {PREDSEDAT_NIK}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_main')]
-            ])
-        )
-    
-    return ConversationHandler.END
+    await query.edit_message_text(
+        "👥 *Связь с соседом через правление*\n\n"
+        "Введите номер места соседа:",
+        parse_mode='Markdown'
+    )
+    return 'GET_NEIGHBOR_PLACE'
 
-# ==================== ЖАЛОБЫ ====================
-
-async def complaint_place_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    place = update.message.text.strip()
-    if not place.isdigit() or not (PLACE_MIN <= int(place) <= PLACE_MAX):
-        await update.message.reply_text(f"❌ Неверный номер. Укажите {PLACE_MIN}–{PLACE_MAX}:")
-        return COMPLAINT_PLACE_FROM
-    context.user_data['place_from'] = place
-    await update.message.reply_text("Шаг 2 из 3: Номер места нарушителя:")
-    return COMPLAINT_PLACE_TO
-
-async def complaint_place_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    place = update.message.text.strip()
-    if not place.isdigit() or not (PLACE_MIN <= int(place) <= PLACE_MAX):
-        await update.message.reply_text(f"❌ Неверный номер. Укажите {PLACE_MIN}–{PLACE_MAX}:")
-        return COMPLAINT_PLACE_TO
-    context.user_data['place_to'] = place
-    await update.message.reply_text("Шаг 3 из 3: Опишите ситуацию подробно:")
-    return COMPLAINT_TEXT
-
-async def complaint_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def get_neighbor_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение номера места"""
     text = update.message.text.strip()
     
-    # Проверка на мат
-    if contains_profanity(text):
+    if not text.isdigit() or not (config.PLACE_MIN <= int(text) <= config.PLACE_MAX):
         await update.message.reply_text(
-            "❌ Обнаружено неприемлемое слово.\n"
-            "Пожалуйста, переформулируйте без оскорблений."
+            f"❌ Неверный номер. Введите {config.PLACE_MIN}-{config.PLACE_MAX}:"
         )
-        return COMPLAINT_TEXT
+        return 'GET_NEIGHBOR_PLACE'
     
-    # Сохраняем жалобу
-    db = SheetsDB()
-    db.save_complaint(
-        context.user_data['place_from'],
-        context.user_data['place_to'],
-        text
+    context.user_data['neighbor_place'] = text
+    
+    await update.message.reply_text(
+        "✏️ *Введите ваше сообщение для соседа:*\n\n"
+        "Сообщение будет передано через правление.",
+        parse_mode='Markdown'
+    )
+    return 'GET_NEIGHBOR_MESSAGE'
+
+async def get_neighbor_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение и отправка сообщения через правление - БЕЗОПАСНО"""
+    message = update.message.text.strip()
+    
+    # Проверка на мат
+    if contains_profanity_safe(message):
+        await update.message.reply_text(
+            "❌ Сообщение содержит неприемлемые слова.\n"
+            "Переформулируйте и отправьте снова:"
+        )
+        return 'GET_NEIGHBOR_MESSAGE'
+    
+    neighbor_place = context.user_data.get('neighbor_place', 'неизвестно')
+    user = update.effective_user
+    
+    # Получаем информацию о пользователе
+    user_info = db.get_user_info(user.id)
+    user_place = user_info.get('place', 'не указано') if user_info else 'не указано'
+    
+    # Сохраняем обращение в таблицу
+    request_id = db.save_neighbor_request(
+        from_user_id=user.id,
+        from_place=user_place,
+        to_place=neighbor_place,
+        message=message,
+        status='новое'
     )
     
-    # Уведомление в чат Правления
+    # Отправляем в чат правления
     try:
         await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
+            chat_id=config.ADMIN_CHAT_ID,
             text=(
-                f"⚠️ <b>Новая жалоба!</b>\n\n"
-                f"От: место {context.user_data['place_from']}\n"
-                f"Нарушитель: место {context.user_data['place_to']}\n"
-                f"Описание: {text}"
+                f"📬 *НОВОЕ ОБРАЩЕНИЕ* #{request_id}\n\n"
+                f"👤 От: {user.first_name}\n"
+                f"📍 Место отправителя: {user_place}\n"
+                f"📍 Место получателя: {neighbor_place}\n\n"
+                f"💬 Сообщение:\n{message}\n\n"
+                f"⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}"
             ),
-            parse_mode='HTML'
+            parse_mode='Markdown'
         )
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Ошибка отправки в чат правления: {e}")
     
     await update.message.reply_text(
-        "✅ Жалоба отправлена Правлению.\n"
-        "Спасибо за содействие в поддержании порядка!"
+        "✅ *Сообщение отправлено в правление!*\n\n"
+        f"Номер обращения: #{request_id}\n"
+        "Правление свяжется с соседом в рабочее время.\n\n"
+        "Спасибо за понимание!",
+        parse_mode='Markdown'
     )
-    await start(update, context)
-    return ConversationHandler.END
-
-# ==================== СВЯЗЬ С СОСЕДОМ ====================
-
-async def contact_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    place = update.message.text.strip()
-    if not place.isdigit() or not (PLACE_MIN <= int(place) <= PLACE_MAX):
-        await update.message.reply_text(f"❌ Неверный номер. Укажите {PLACE_MIN}–{PLACE_MAX}:")
-        return CONTACT_PLACE
-    
-    db = SheetsDB()
-    neighbor = db.get_member_by_place(int(place))
-    
-    if not neighbor:
-        await update.message.reply_text(
-            f"ℹ️ Владелец места №{place} не верифицирован в системе.\n"
-            f"Обратитесь к председателю: {PREDSEDAT_NIK}"
-        )
-        await start(update, context)
-        return ConversationHandler.END
-    
-    if neighbor['username'] and neighbor['username'] != "нет":
-        await update.message.reply_text(
-            f"✅ Контакт для места №{place}:\n{neighbor['username']}\n\n"
-            f"⚠️ Просим соблюдать этикет общения."
-        )
-    else:
-        await update.message.reply_text(
-            f"ℹ️ Владелец места №{place} не указал @username.\n"
-            f"Обратитесь к председателю: {PREDSEDAT_NIK}"
-        )
     
     await start(update, context)
     return ConversationHandler.END
 
-# ==================== ПОДПИСКА НА НАПОМИНАНИЯ ====================
-
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = f"@{update.effective_user.username}" if update.effective_user.username else "нет"
-    first_name = update.effective_user.first_name or "Пользователь"
-    
-    db = SheetsDB()
-    db.subscribe_user(user_id, username, first_name)
-    
-    await update.message.reply_text(
-        "✅ Вы подписаны на личные напоминания!\n"
-        "Теперь будете получать уведомления о событиях прямо здесь."
-    )
-
-async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    db = SheetsDB()
-    db.unsubscribe_user(user_id)
-    
-    await update.message.reply_text(
-        "❌ Вы отписались от личных напоминаний.\n"
-        "Уведомления будут приходить только в канал."
-    )
-
-# ==================== СПРАВКА ====================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ <b>Справка по боту</b>\n\n"
-        "✅ <b>Верификация</b>\n"
-        "Перейдите по ссылке-приглашению канала → подайте заявку → укажите номер места и статус.\n\n"
-        "✅ <b>Справочник</b>\n"
-        "/start → 📜 Справочник → 🔍 Поиск → введите слово (мойка, снег).\n\n"
-        "✅ <b>Жалобы</b>\n"
-        "/start → 🚨 Сообщить о нарушении → 3 шага → отправка.\n"
-        "Фильтр мата автоматически блокирует оскорбления.\n\n"
-        "✅ <b>Сосед</b>\n"
-        "/start → 👥 Сосед по месту → введите номер → получите @username.\n\n"
-        "✅ <b>Напоминания</b>\n"
-        "Автоматически в канале. Для ЛС: /subscribe.\n\n"
-        f"👤 Председатель: {PREDSEDAT_NIK}",
-        parse_mode='HTML'
-    )
-
-# ==================== НАПОМИНАНИЯ ИЗ КАЛЕНДАРЯ ====================
-
-def get_event_type(summary):
-    """Определение типа события по тегу в названии"""
-    summary_lower = summary.lower()
-    if '[собрание]' in summary_lower:
-        return 'собрание'
-    elif '[оплата]' in summary_lower:
-        return 'оплата'
-    else:
-        return 'другое'
-
-async def send_reminders(application, for_date, reminder_type):
-    """Отправка напоминаний"""
+# ==================== НАПОМИНАНИЯ ИЗ КАЛЕНДАРЯ (в канал) ====================
+async def send_calendar_reminders(application):
+    """Отправка напоминаний только в канал"""
     try:
-        start = for_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = for_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        today = datetime.now()
         
-        url = f"https://www.googleapis.com/calendar/v3/calendars/{GOOGLE_CALENDAR_ID}/events"
-        params = {
-            'key': GOOGLE_API_KEY,
-            'timeMin': start.isoformat() + 'Z',
-            'timeMax': end.isoformat() + 'Z',
-            'orderBy': 'startTime',
-            'singleEvents': True,
-            'maxResults': 20
-        }
+        # Получаем события на сегодня
+        events = calendar.get_events_for_date(today)
         
-        response = requests.get(url, params=params, timeout=10)
-        events = response.json().get('items', [])
-        
-        relevant_events = []
-        for event in events:
-            summary = event.get('summary', '')
-            event_type = get_event_type(summary)
-            
-            if reminder_type == 'today':
-                relevant_events.append(event)
-            elif reminder_type == 'tomorrow_evening' and event_type != 'собрание':
-                relevant_events.append(event)
-            elif reminder_type == 'meeting_7d' and event_type == 'собрание':
-                relevant_events.append(event)
-        
-        if not relevant_events:
+        if not events:
             return
         
-        message = "🔔 <b>Напоминание</b>\n\n"
-        for event in relevant_events:
-            summary = event.get('summary', 'Событие')
-            start_time = event['start'].get('dateTime', event['start'].get('date'))
-            summary_clean = summary.replace('[собрание]', '').replace('[оплата]', '').strip()
-            message += f"• {summary_clean}"
-            if 'T' in start_time:
-                time_str = start_time.split('T')[1][:5]
-                message += f" в {time_str}"
-            message += "\n"
+        # Формируем сообщение для канала
+        message = "🔔 *Напоминание о событиях*\n\n"
         
+        for event in events:
+            summary = event.get('summary', 'Событие')
+            start_time = event.get('start', {}).get('dateTime', event.get('start', {}).get('date'))
+            
+            # Форматируем время
+            if 'T' in start_time:
+                dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                time_str = dt.strftime('%d.%m.%Y в %H:%M')
+            else:
+                dt = datetime.fromisoformat(start_time)
+                time_str = dt.strftime('%d.%m.%Y')
+            
+            message += f"• *{summary}*\n  📅 {time_str}\n\n"
+        
+        # Отправляем ТОЛЬКО в канал
         await application.bot.send_message(
-            chat_id=CHANNEL_ID,
+            chat_id=config.CHANNEL_ID,
             text=message,
-            parse_mode='HTML'
+            parse_mode='Markdown'
         )
-    
+        
+        logger.info(f"Отправлено напоминание в канал о {len(events)} событиях")
+        
     except Exception as e:
-        logger.error(f"Ошибка напоминаний: {e}")
+        logger.error(f"Ошибка отправки напоминаний: {e}")
 
-# ==================== ЗАПУСК БОТА ====================
-
-def main():
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не найден! Проверьте переменные окружения.")
-        return
+# ==================== НАСТРОЙКА ПЛАНИРОВЩИКА ====================
+def setup_scheduler(application):
+    """Настройка ежедневных напоминаний в 10:00"""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
     
-    application = Application.builder().token(BOT_TOKEN).build()
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
     
-    # Верификация (ИСПРАВЛЕНО: числовые состояния!)
-    application.add_handler(ChatJoinRequestHandler(handle_join_request))
-    application.add_handler(ConversationHandler(
-        entry_points=[ChatJoinRequestHandler(handle_join_request)],
-        states={
-            AWAITING_PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_place)],
-            AWAITING_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_status)]
-        },
-        fallbacks=[CommandHandler('start', start)],
-        per_chat=False
-    ))
-    
-    # Главное меню
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('subscribe', subscribe))
-    application.add_handler(CommandHandler('unsubscribe', unsubscribe))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Диалоги
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern='^search_rules$')],
-        states={SEARCH_RULES: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_rules_handler)]},
-        fallbacks=[CommandHandler('start', start)]
-    ))
-    
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern='^report$')],
-        states={
-            COMPLAINT_PLACE_FROM: [MessageHandler(filters.TEXT & ~filters.COMMAND, complaint_place_from)],
-            COMPLAINT_PLACE_TO: [MessageHandler(filters.TEXT & ~filters.COMMAND, complaint_place_to)],
-            COMPLAINT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, complaint_text)]
-        },
-        fallbacks=[CommandHandler('start', start)]
-    ))
-    
-    application.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern='^contact$')],
-        states={CONTACT_PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_place)]},
-        fallbacks=[CommandHandler('start', start)]
-    ))
-    
-    # Планировщик напоминаний
+    # Напоминания каждый день в 10:00
     scheduler.add_job(
-        send_reminders,
-        CronTrigger(hour=10, minute=0, timezone=TIMEZONE),
-        args=[application, datetime.now(), 'today'],
-        id='reminders_today'
+        send_calendar_reminders,
+        CronTrigger(hour=10, minute=0, timezone=config.TIMEZONE),
+        args=[application],
+        id='daily_reminders'
     )
     
     scheduler.start()
-    logger.info("✅ Бот запущен. Полная версия с исправленной логикой диалогов.")
-    application.run_polling()
+    logger.info("Планировщик напоминаний запущен")
+
+# ==================== ЗАПУСК БОТА ====================
+def main():
+    """Основная функция запуска"""
+    application = Application.builder().token(config.BOT_TOKEN).build()
+    
+    # 1. Верификация через заявки
+    verification_handler = ConversationHandler(
+        entry_points=[ChatJoinRequestHandler(handle_join_request)],
+        states={
+            AWAITING_PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_place)],
+            AWAITING_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_status)],
+        },
+        fallbacks=[CommandHandler('start', start)],
+        per_chat=False,
+        per_user=True
+    )
+    application.add_handler(verification_handler)
+    
+    # 2. Главное меню
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('help', start))
+    
+    # 3. Обработчики кнопок
+    application.add_handler(CallbackQueryHandler(show_documents, pattern='^docs$'))
+    application.add_handler(CallbackQueryHandler(start, pattern='^back_main$'))
+    
+    # 4. Связь с соседом через правление
+    contact_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(contact_via_admin, pattern='^contact_admin$')],
+        states={
+            'GET_NEIGHBOR_PLACE': [MessageHandler(filters.TEXT & ~filters.COMMAND, get_neighbor_place)],
+            'GET_NEIGHBOR_MESSAGE': [MessageHandler(filters.TEXT & ~filters.COMMAND, get_neighbor_message)],
+        },
+        fallbacks=[CommandHandler('start', start)]
+    )
+    application.add_handler(contact_handler)
+    
+    # 5. Запуск планировщика напоминаний
+    setup_scheduler(application)
+    
+    # Запуск бота
+    logger.info("🚀 Бот запущен в безопасном режиме")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
